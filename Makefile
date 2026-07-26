@@ -21,6 +21,8 @@ $(LIB_A): $(OBJS)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(OBJS) $(LIB_SO) $(LIB_A)
+	# .built is the stamp raptor/Makefile builds this directory through, and
+	# must not outlive the library it stands for.
+	rm -f $(OBJS) $(LIB_SO) $(LIB_A) .built
 
 .PHONY: all clean

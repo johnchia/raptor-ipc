@@ -3,3 +3,6 @@
 *.d
 tests/tests
 *.so
+
+# build stamp: raptor/Makefile builds this directory through it
+.built
