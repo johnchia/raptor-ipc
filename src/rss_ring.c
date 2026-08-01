@@ -41,9 +41,43 @@
 
 /* Cross-process futex on SHM: FUTEX_WAIT/FUTEX_WAKE without FUTEX_PRIVATE_FLAG.
  * Private flag would use process-local hash — must NOT be set for shared memory. */
+
+/*
+ * The timeout cannot be libc's struct timespec on a 32-bit target.
+ *
+ * Legacy SYS_futex reads a kernel timespec whose width follows the
+ * architecture: two 32-bit fields on a 32-bit machine. A libc whose time_t is
+ * 32 bits lays struct timespec out identically, so passing it straight through
+ * happens to work -- which is what glibc/armhf does. musl makes time_t 64 bits
+ * on every target including 32-bit ones, so its struct timespec opens with an
+ * 8-byte tv_sec and the kernel reads tv_nsec out of that field's upper half.
+ * For any timeout under a second that yields {0, 0}, so the wait returns
+ * ETIMEDOUT immediately and a caller pacing itself on the timeout spins
+ * instead of sleeping.
+ *
+ * SYS_futex_time64 is the kernel's other answer to this, but it arrives in 5.1
+ * and the SigmaStar targets run 4.9. Converting explicitly works on both libcs
+ * and every kernel: these timeouts are relative and seconds-scale, so 32 bits
+ * is not a range worth worrying about.
+ */
 static int futex_wait(uint32_t *addr, uint32_t expected, const struct timespec *timeout)
 {
+#if __SIZEOF_POINTER__ == 4
+    struct {
+        int32_t tv_sec;
+        int32_t tv_nsec;
+    } kts;
+    const void *tp = NULL;
+
+    if (timeout) {
+        kts.tv_sec = (int32_t)timeout->tv_sec;
+        kts.tv_nsec = (int32_t)timeout->tv_nsec;
+        tp = &kts;
+    }
+    return (int)syscall(SYS_futex, addr, FUTEX_WAIT, expected, tp, NULL, 0);
+#else
     return (int)syscall(SYS_futex, addr, FUTEX_WAIT, expected, timeout, NULL, 0);
+#endif
 }
 
 static int futex_wake(uint32_t *addr, int count)
