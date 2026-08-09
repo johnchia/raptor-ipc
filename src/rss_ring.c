@@ -101,6 +101,8 @@ struct rss_ring {
     rss_ring_header_t *header;
     rss_ring_slot_t *slots;
     uint32_t open_incarnation; /* incarnation at time of open */
+    uint32_t own_data_size;    /* producer: data region THIS handle mapped */
+    uint32_t own_slot_count;   /* producer: slots THIS handle mapped */
     uint8_t *data;
     size_t total_size;
     int shm_fd;
@@ -192,6 +194,12 @@ rss_ring_t *rss_ring_create(const char *name, uint32_t slot_count, uint32_t data
     atomic_store_explicit(&ring->header->data_head, 0, memory_order_relaxed);
     ring->header->version = RSS_RING_VERSION;
     atomic_store_explicit(&ring->header->incarnation, prev_inc + 1, memory_order_relaxed);
+    /* Remember the geometry this handle actually mapped. The header is
+     * shared and a later create() may enlarge it; publishing must be
+     * bounded by what we mapped, never by what the header now claims. */
+    ring->own_data_size = data_size;
+    ring->own_slot_count = slot_count;
+    ring->open_incarnation = prev_inc + 1;
 
     /* Initialise all slot sequences to UINT64_MAX (sentinel — never matches
      * a valid read_seq). Prevents phantom reads when a fresh consumer starts
@@ -256,8 +264,18 @@ int rss_ring_publish_iov(rss_ring_t *ring, const rss_iov_t *iov, uint32_t iov_co
         return -EINVAL;
 
     rss_ring_header_t *hdr = ring->header;
-    uint32_t data_size = hdr->data_size;
-    uint32_t slot_count = hdr->slot_count;
+
+    /* Someone re-created this ring underneath us: the shm was
+     * ftruncated and the header now describes a region this handle
+     * never mapped. Publishing on those terms walks off the end of our
+     * own mapping -- a wild write ASan caught as a SEGV inside the
+     * memcpy below. The producer is superseded; say so. */
+    if (atomic_load_explicit(&hdr->incarnation, memory_order_acquire) != ring->open_incarnation)
+        return -EPIPE;
+
+    /* Bound by what this handle mapped, not by the shared header. */
+    uint32_t data_size = ring->own_data_size ? ring->own_data_size : hdr->data_size;
+    uint32_t slot_count = ring->own_slot_count ? ring->own_slot_count : hdr->slot_count;
 
     /* Frame larger than entire data region — reject. */
     if (length > data_size)
@@ -366,7 +384,14 @@ int rss_ring_publish_ref(rss_ring_t *ring, uint32_t rmem_offset, uint32_t length
     if (buf_idx >= hdr->ref_buf_count)
         return -EINVAL;
 
-    uint32_t slot_count = hdr->slot_count;
+    /* Same supersede check as the embedded path: refmode keeps frame
+     * data in rmem, but the slot array still lives in this handle's
+     * mapping, and a re-create with more slots would push the index
+     * past its end. This is the path devices use. */
+    if (atomic_load_explicit(&hdr->incarnation, memory_order_acquire) != ring->open_incarnation)
+        return -EPIPE;
+
+    uint32_t slot_count = ring->own_slot_count ? ring->own_slot_count : hdr->slot_count;
     uint64_t seq = atomic_load_explicit(&hdr->write_seq, memory_order_relaxed) + 1;
     uint32_t slot_idx = (uint32_t)(seq % slot_count);
     rss_ring_slot_t *slot = &ring->slots[slot_idx];
