@@ -426,14 +426,58 @@ void rss_ring_set_stream_info(rss_ring_t *ring, uint32_t stream_id, uint32_t cod
     if (!ring || !ring->is_producer)
         return;
 
-    ring->header->stream_id = stream_id;
-    ring->header->codec = codec;
-    ring->header->width = width;
-    ring->header->height = height;
-    ring->header->fps_num = fps_num;
-    ring->header->fps_den = fps_den;
-    ring->header->profile = profile;
-    ring->header->level = level;
+    rss_ring_header_t *h = ring->header;
+    uint16_t gen = atomic_load_explicit(&h->info_gen, memory_order_relaxed);
+
+    /* Same seqlock shape as set_utc below: this cluster is rewritten in
+     * place across an encoder restart (the ring itself is reused), and a
+     * consumer polling it live must never see the new width beside the
+     * old height. */
+    atomic_store_explicit(&h->info_gen, (uint16_t)(gen + 1), memory_order_relaxed);
+    atomic_thread_fence(memory_order_release);
+    h->stream_id = stream_id;
+    h->codec = codec;
+    h->width = width;
+    h->height = height;
+    h->fps_num = fps_num;
+    h->fps_den = fps_den;
+    h->profile = profile;
+    h->level = level;
+    atomic_store_explicit(&h->info_gen, (uint16_t)(gen + 2), memory_order_release);
+}
+
+int rss_ring_get_stream_info(rss_ring_t *ring, rss_stream_info_t *out)
+{
+    if (!ring || !out)
+        return -EINVAL;
+
+    const rss_ring_header_t *h = ring->header;
+
+    for (int retry = 0; retry < 8; retry++) {
+        uint16_t g1 = atomic_load_explicit(&h->info_gen, memory_order_acquire);
+        if (g1 & 1)
+            continue;
+
+        rss_stream_info_t v = {
+            .stream_id = h->stream_id,
+            .codec = h->codec,
+            .width = h->width,
+            .height = h->height,
+            .fps_num = h->fps_num,
+            .fps_den = h->fps_den,
+            .profile = h->profile,
+            .level = h->level,
+        };
+
+        atomic_thread_fence(memory_order_acquire);
+        uint16_t g2 = atomic_load_explicit(&h->info_gen, memory_order_relaxed);
+        if (g1 != g2)
+            continue;
+
+        *out = v;
+        return 0;
+    }
+    return -EAGAIN;
 }
 
 void rss_ring_set_utc(rss_ring_t *ring, int64_t offset_us, uint8_t status)

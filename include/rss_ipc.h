@@ -83,7 +83,16 @@ typedef struct __attribute__((aligned(64))) {
     uint32_t fps_num, fps_den;
     uint8_t profile; /* H.264 profile_idc (66=Base,77=Main,100=High) */
     uint8_t level;   /* H.264 level_idc (30,31,40,51...)            */
-    uint16_t _reserved;
+    /* Seqlock generation for the stream-info cluster above (stream_id..
+     * level) — odd while a producer rewrite is in progress. Lives in what
+     * was reserved padding, so the layout and version are unchanged: an
+     * old producer simply never moves it and readers of such a ring see a
+     * constant even value, which degrades to the historical plain read. A
+     * one-shot read at open needs none of this — the magic release/acquire
+     * contract already orders it; the seqlock exists for LIVE re-reads,
+     * where rvd rewrites the cluster in place across an encoder restart
+     * and a torn (width,height) pair is otherwise observable. */
+    _Atomic uint16_t info_gen;
     _Atomic uint32_t magic; /* RSS_RING_MAGIC — written last (release)     */
     uint32_t version;
     _Atomic uint32_t incarnation;  /* incremented each create (crash detection)  */
@@ -145,6 +154,25 @@ int rss_ring_publish_iov(rss_ring_t *ring, const rss_iov_t *iov, uint32_t iov_co
 void rss_ring_set_stream_info(rss_ring_t *ring, uint32_t stream_id, uint32_t codec, uint32_t width,
                               uint32_t height, uint32_t fps_num, uint32_t fps_den, uint8_t profile,
                               uint8_t level);
+
+/* Consistent snapshot of the header's stream-info cluster. */
+typedef struct {
+    uint32_t stream_id;
+    uint32_t codec;
+    uint32_t width, height;
+    uint32_t fps_num, fps_den;
+    uint8_t profile;
+    uint8_t level;
+} rss_stream_info_t;
+
+/* Read the stream-info cluster under its seqlock so a live producer
+ * rewrite (encoder restart reusing the ring) can never hand back a torn
+ * pair like the new width with the old height. Returns 0 on success;
+ * -EAGAIN if a rewrite persisted across the bounded retry (keep the
+ * previous values and try again next pass). Rings from producers that
+ * predate info_gen read as a constant even generation and always
+ * succeed, exactly like the historical plain read. */
+int rss_ring_get_stream_info(rss_ring_t *ring, rss_stream_info_t *out);
 
 /* Reference mode: frame data in external /dev/rmem instead of ring data region.
  * Eliminates the publish-side memcpy. Consumers transparently mmap /dev/rmem
