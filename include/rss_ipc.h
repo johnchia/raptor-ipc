@@ -329,8 +329,28 @@ int rss_ctrl_accept_and_handle(rss_ctrl_t *ctrl,
                                void *userdata);
 
 /* Client API (raptorctl side) */
+
+/*
+ * Send a request and copy the reply into resp_buf. Returns the number of bytes
+ * copied, or a negative errno.
+ *
+ * A reply larger than resp_buf is TRUNCATED SILENTLY, because the common
+ * caller is a liveness probe with a small buffer that cares only that
+ * something answered. Anything that parses the reply, or that cannot bound its
+ * size in advance, must use rss_ctrl_send_command_alloc() -- a cut reply is
+ * invalid JSON and nothing in the return value says so.
+ */
 int rss_ctrl_send_command(const char *sock_path, const char *cmd_json, char *resp_buf,
                           int resp_buf_size, uint32_t timeout_ms);
+
+/*
+ * As above, onto the heap: *resp_out is the caller's to free on success, and
+ * is untouched on failure. For replies whose size is not known in advance --
+ * rcd's schema is one, and it is larger than any stack buffer a caller would
+ * think to declare.
+ */
+int rss_ctrl_send_command_alloc(const char *sock_path, const char *cmd_json, char **resp_out,
+                                uint32_t timeout_ms);
 
 #ifdef __cplusplus
 }

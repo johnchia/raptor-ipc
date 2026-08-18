@@ -306,12 +306,13 @@ done:
 /*  Client API (raptorctl side)                                       */
 /* ------------------------------------------------------------------ */
 
-int rss_ctrl_send_command(const char *sock_path, const char *cmd_json, char *resp_buf,
-                          int resp_buf_size, uint32_t timeout_ms)
+/*
+ * The transport, shared by both entry points below: connect, send, and read
+ * the whole reply onto the heap. `*out` is the caller's on success.
+ */
+static int ctrl_exchange(const char *sock_path, const char *cmd_json, char **out,
+                         uint32_t timeout_ms)
 {
-    if (!sock_path || !cmd_json || !resp_buf || resp_buf_size <= 0)
-        return -EINVAL;
-
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0)
         return -errno;
@@ -345,14 +346,54 @@ int rss_ctrl_send_command(const char *sock_path, const char *cmd_json, char *res
     if (rlen < 0)
         return rlen;
 
-    if (!resp || rlen == 0)
+    if (!resp || rlen == 0) {
+        free(resp);
         return -EPROTO;
+    }
 
-    /* Copy response into caller's buffer. */
+    *out = resp;
+    return rlen;
+}
+
+int rss_ctrl_send_command(const char *sock_path, const char *cmd_json, char *resp_buf,
+                          int resp_buf_size, uint32_t timeout_ms)
+{
+    if (!sock_path || !cmd_json || !resp_buf || resp_buf_size <= 0)
+        return -EINVAL;
+
+    char *resp = NULL;
+    int rlen = ctrl_exchange(sock_path, cmd_json, &resp, timeout_ms);
+    if (rlen < 0)
+        return rlen;
+
+    /*
+     * Copy into the caller's buffer, truncating if it does not fit.
+     *
+     * Truncating silently is deliberate rather than merely old: the common
+     * use of this call is a liveness probe that passes a small buffer and
+     * cares only that something answered, and rvd's status reply is far
+     * larger than any of them. Returning an error for a short buffer would
+     * turn every one of those probes into a false negative.
+     *
+     * The cost is that a caller which does parse the reply gets invalid JSON
+     * with nothing about it to show that it was cut. Such a caller should use
+     * rss_ctrl_send_command_alloc() instead, and must whenever the reply's
+     * size is not known in advance.
+     */
     int copy_len = rlen < resp_buf_size - 1 ? rlen : resp_buf_size - 1;
     memcpy(resp_buf, resp, (size_t)copy_len);
     resp_buf[copy_len] = '\0';
     free(resp);
 
     return copy_len;
+}
+
+int rss_ctrl_send_command_alloc(const char *sock_path, const char *cmd_json, char **resp_out,
+                                uint32_t timeout_ms)
+{
+    if (!sock_path || !cmd_json || !resp_out)
+        return -EINVAL;
+
+    *resp_out = NULL;
+    return ctrl_exchange(sock_path, cmd_json, resp_out, timeout_ms);
 }
