@@ -115,7 +115,16 @@ typedef struct __attribute__((aligned(64))) {
      * of 0 means no mapping is published (producer has no wall clock). */
     _Atomic uint32_t utc_gen; /* seqlock generation — odd while updating     */
     uint8_t utc_status;       /* ST 0603 time status (RSS_UTC_STATUS_*)      */
-    uint8_t _pad_utc[3];
+    /* Bumped by every enable_refmode(): an encoder restart on a REUSED ring
+     * replaces the backing region (new enc SHM object, possibly new size)
+     * while consumers hold a mapping made at open. A consumer that sees the
+     * generation move remaps before resolving frame data — without this it
+     * reads frozen bytes from the unlinked old object under fresh slot
+     * metadata. Lives in former padding: layout and version unchanged; old
+     * producers never move it and their consumers never remap, exactly the
+     * historical behavior. */
+    _Atomic uint8_t ref_gen;
+    uint8_t _pad_utc[2];
     int64_t utc_offset_us; /* CLOCK_REALTIME − producer media clock, µs   */
 } rss_ring_header_t;
 

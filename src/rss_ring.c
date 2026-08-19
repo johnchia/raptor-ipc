@@ -108,9 +108,72 @@ struct rss_ring {
     int shm_fd;
     bool is_producer;
     char name[64];
-    uint8_t *ref_data; /* consumer: /dev/rmem mmap (NULL if embedded) */
-    int ref_fd;        /* consumer: /dev/rmem fd (-1 if not open)     */
+    uint8_t *ref_data;        /* consumer: /dev/rmem mmap (NULL if embedded) */
+    int ref_fd;               /* consumer: /dev/rmem fd (-1 if not open)     */
+    uint8_t ref_open_gen;     /* consumer: header ref_gen this mapping matches */
+    uint32_t ref_mapped_size; /* consumer: size THIS mapping was made with */
 };
+
+/* Map (or re-map) the refmode backing region per the CURRENT header:
+ * named enc SHM first, /dev/rmem fallback. Records the header's ref_gen
+ * so the read path can tell when the producer swapped the region. */
+static int ring_map_ref(rss_ring_t *ring)
+{
+    rss_ring_header_t *hdr = ring->header;
+    char enc_shm[128];
+    snprintf(enc_shm, sizeof(enc_shm), "/rss_enc_%s", ring->name);
+    ring->ref_open_gen = atomic_load_explicit(&hdr->ref_gen, memory_order_acquire);
+    ring->ref_fd = shm_open(enc_shm, O_RDONLY, 0);
+    if (ring->ref_fd < 0) {
+        RSS_IPC_TRACE("ring %s: shm_open(%s) failed, trying /dev/rmem", ring->name, enc_shm);
+        ring->ref_fd = open("/dev/rmem", O_RDONLY);
+        if (ring->ref_fd >= 0)
+            ring->ref_data = mmap(NULL, hdr->ref_rmem_size, PROT_READ, MAP_SHARED, ring->ref_fd,
+                                  (off_t)hdr->ref_rmem_offset);
+        else
+            RSS_IPC_WARN("ring %s: refmode: no shm and no /dev/rmem", ring->name);
+    } else {
+        ring->ref_data = mmap(NULL, hdr->ref_rmem_size, PROT_READ, MAP_SHARED, ring->ref_fd, 0);
+    }
+    if (!ring->ref_data || ring->ref_data == MAP_FAILED) {
+        RSS_IPC_WARN("ring %s: refmode mmap failed: size=%u offset=%u: %s", ring->name,
+                     hdr->ref_rmem_size, hdr->ref_rmem_offset, strerror(errno));
+        ring->ref_data = NULL;
+        if (ring->ref_fd >= 0)
+            close(ring->ref_fd);
+        ring->ref_fd = -1;
+        return -1;
+    }
+    ring->ref_mapped_size = hdr->ref_rmem_size;
+    return 0;
+}
+
+static void ring_unmap_ref(rss_ring_t *ring)
+{
+    if (ring->ref_data)
+        munmap(ring->ref_data, ring->ref_mapped_size);
+    ring->ref_data = NULL;
+    ring->ref_mapped_size = 0;
+    if (ring->ref_fd >= 0)
+        close(ring->ref_fd);
+    ring->ref_fd = -1;
+}
+
+/* The producer bumped ref_gen (encoder restart replaced the region):
+ * remap before resolving any frame data through the old mapping. On a
+ * transient failure the caller reports EOVERFLOW and retries later. */
+static int ring_ref_sync(rss_ring_t *ring)
+{
+    if (!ring->ref_data)
+        return 0;
+    uint8_t gen = atomic_load_explicit(&ring->header->ref_gen, memory_order_acquire);
+    if (gen == ring->ref_open_gen)
+        return 0;
+    RSS_IPC_WARN("ring %s: ref region replaced (gen %u -> %u), remapping", ring->name,
+                 ring->ref_open_gen, gen);
+    ring_unmap_ref(ring);
+    return ring_map_ref(ring);
+}
 
 /*
  * Compute mmap layout offsets:
@@ -363,6 +426,15 @@ int rss_ring_enable_refmode(rss_ring_t *ring, uint32_t rmem_size, uint32_t rmem_
     for (uint8_t i = 0; i < RSS_RING_MAX_REF_BUFS; i++)
         atomic_store_explicit(&hdr->ref_buf_gen[i], 0, memory_order_relaxed);
 
+    /* Every (re-)enable moves the region generation: a consumer holding a
+     * mapping from before this call must remap before trusting offsets
+     * into the region (see ring_ref_sync). Release-ordered after the
+     * region fields above so a consumer that observes the new generation
+     * also observes the geometry it describes. */
+    atomic_store_explicit(&hdr->ref_gen,
+                          (uint8_t)(atomic_load_explicit(&hdr->ref_gen, memory_order_relaxed) + 1),
+                          memory_order_release);
+
     /* Re-publish magic with release ordering so consumers see the flags
      * update. Without this, a consumer opening between create() and
      * enable_refmode() could see flags=0 despite magic being valid. */
@@ -603,27 +675,7 @@ rss_ring_t *rss_ring_open(const char *name)
      * Try named POSIX SHM first (universal, works on all SoCs).
      * Fall back to /dev/rmem for T31/T40/T41 backward compat. */
     if (hdr->flags & RSS_RING_FLAG_REFMODE) {
-        char enc_shm[128];
-        snprintf(enc_shm, sizeof(enc_shm), "/rss_enc_%s", ring->name);
-        ring->ref_fd = shm_open(enc_shm, O_RDONLY, 0);
-        if (ring->ref_fd < 0) {
-            RSS_IPC_TRACE("ring_open %s: shm_open(%s) failed, trying /dev/rmem", name, enc_shm);
-            ring->ref_fd = open("/dev/rmem", O_RDONLY);
-            if (ring->ref_fd >= 0)
-                ring->ref_data = mmap(NULL, hdr->ref_rmem_size, PROT_READ, MAP_SHARED, ring->ref_fd,
-                                      (off_t)hdr->ref_rmem_offset);
-            else
-                RSS_IPC_WARN("ring_open %s: refmode: no shm and no /dev/rmem", name);
-        } else {
-            ring->ref_data = mmap(NULL, hdr->ref_rmem_size, PROT_READ, MAP_SHARED, ring->ref_fd, 0);
-        }
-        if (!ring->ref_data || ring->ref_data == MAP_FAILED) {
-            RSS_IPC_WARN("ring_open %s: refmode mmap failed: size=%u offset=%u: %s", name,
-                         hdr->ref_rmem_size, hdr->ref_rmem_offset, strerror(errno));
-            ring->ref_data = NULL;
-            if (ring->ref_fd >= 0)
-                close(ring->ref_fd);
-            ring->ref_fd = -1;
+        if (ring_map_ref(ring) != 0) {
             munmap(base, ring->total_size);
             goto fail;
         }
@@ -643,10 +695,7 @@ void rss_ring_close(rss_ring_t *ring)
     if (!ring)
         return;
 
-    if (ring->ref_data && ring->ref_data != MAP_FAILED)
-        munmap(ring->ref_data, ring->header ? ring->header->ref_rmem_size : 0);
-    if (ring->ref_fd >= 0)
-        close(ring->ref_fd);
+    ring_unmap_ref(ring);
 
     if (ring->header && ring->header != MAP_FAILED)
         munmap(ring->header, ring->total_size);
@@ -709,6 +758,14 @@ int rss_ring_read(rss_ring_t *ring, uint64_t *read_seq, uint8_t *dest, uint32_t 
         (*read_seq)++;
         *length = data_length;
         return -ENOSPC;
+    }
+
+    /* The producer may have replaced the ref region (encoder restart on a
+     * reused ring); resolving through the old mapping returns frozen bytes
+     * under fresh metadata. */
+    if (ring_ref_sync(ring) != 0) {
+        *read_seq = wseq;
+        return RSS_EOVERFLOW;
     }
 
     /* Bounds check: ensure offset+length doesn't exceed the backing region. */
@@ -796,6 +853,12 @@ int rss_ring_peek(rss_ring_t *ring, uint64_t *read_seq, const uint8_t **data_ptr
 
     uint32_t data_offset = slot->data_offset;
     uint32_t data_length = slot->data_length;
+
+    /* Same region-replacement guard as the copying read. */
+    if (ring_ref_sync(ring) != 0) {
+        *read_seq = wseq;
+        return RSS_EOVERFLOW;
+    }
 
     uint32_t region_size = ring->ref_data ? hdr->ref_rmem_size : hdr->data_size;
     if (data_offset > region_size || data_length > region_size - data_offset) {
