@@ -143,21 +143,43 @@ static int ctrl_connect(int fd, const struct sockaddr_un *addr, uint32_t timeout
 }
 
 /*
- * Read exactly `count` bytes from fd into buf.
+ * Read exactly `count` bytes from fd into buf, against an absolute deadline.
+ *
+ * A deadline rather than a timeout per poll, which is what this used to take.
+ * The difference does not show against a peer that says nothing -- that costs
+ * one timeout either way -- but a peer that keeps sending, slowly, restarted
+ * the clock with every byte it sent. Measured: a 300 ms budget against a peer
+ * writing one byte every 250 ms returned after 10.8 seconds, thirty-six times
+ * the budget, and returned *successfully*. It scales with the length of the
+ * message, so a full-sized reply is thousands of times the budget rather than
+ * tens.
+ *
+ * `deadline_ms` of 0 means no deadline, which is what a timeout of 0 has
+ * always meant here.
+ *
  * Returns 0 on success, -errno on error, -ECONNRESET on EOF.
  */
-static int read_exact(int fd, void *buf, size_t count, uint32_t timeout_ms)
+static int read_exact(int fd, void *buf, size_t count, int64_t deadline_ms)
 {
     uint8_t *p = buf;
     size_t remaining = count;
 
     while (remaining > 0) {
-        if (timeout_ms > 0) {
+        if (deadline_ms > 0) {
             struct pollfd pfd = {.fd = fd, .events = POLLIN};
             int pr;
-            do {
-                pr = poll(&pfd, 1, (int)timeout_ms);
-            } while (pr < 0 && errno == EINTR);
+
+            /* Recomputed every time round, including after a signal, so
+             * neither a slow sender nor a stream of EINTR buys more time. */
+            for (;;) {
+                int64_t left = deadline_ms - mono_ms();
+
+                if (left <= 0)
+                    return -ETIMEDOUT;
+                pr = poll(&pfd, 1, (int)left);
+                if (pr >= 0 || errno != EINTR)
+                    break;
+            }
 
             if (pr < 0)
                 return -errno;
@@ -214,8 +236,13 @@ static int write_exact(int fd, const void *buf, size_t count)
  */
 static int read_message(int fd, char **out_buf, uint32_t timeout_ms)
 {
+    /* One deadline for the whole message. The length and the body are two
+     * reads of one thing, and giving each its own budget is what let a
+     * trickling peer hold a caller for a multiple of it. */
+    int64_t deadline = timeout_ms > 0 ? mono_ms() + (int64_t)timeout_ms : 0;
+
     uint8_t len_buf[2];
-    int ret = read_exact(fd, len_buf, 2, timeout_ms);
+    int ret = read_exact(fd, len_buf, 2, deadline);
     if (ret < 0)
         return ret;
 
@@ -229,7 +256,7 @@ static int read_message(int fd, char **out_buf, uint32_t timeout_ms)
     if (!buf)
         return -ENOMEM;
 
-    ret = read_exact(fd, buf, msg_len, timeout_ms);
+    ret = read_exact(fd, buf, msg_len, deadline);
     if (ret < 0) {
         free(buf);
         return ret;
@@ -356,7 +383,7 @@ int rss_ctrl_accept_and_handle(rss_ctrl_t *ctrl,
         return -errno;
 
     /* Set write timeout so a slow/stalled client can't block the daemon
-     * indefinitely. Read side is already covered by poll() in read_exact. */
+     * indefinitely. The read side is bounded by the deadline in read_exact. */
     struct timeval snd_tv = {.tv_sec = 5, .tv_usec = 0};
     (void)setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &snd_tv, sizeof(snd_tv));
 
@@ -364,9 +391,15 @@ int rss_ctrl_accept_and_handle(rss_ctrl_t *ctrl,
     char *cmd = NULL;
     char *resp_buf = NULL;
 
-    /* Read the request (5s timeout per poll — a client trickling one byte
-     * every 4.9s could hold the handler longer, but on a root-only local
-     * Unix socket this is not a practical attack vector). */
+    /*
+     * Read the request, bounded at five seconds for the whole message rather
+     * than for each poll of it. It used to be per poll, excused on the
+     * grounds that the socket was root-only and local -- which was never true
+     * of this socket: it is created 0666 on purpose, a few lines above, so
+     * that a non-root client can use it. A local process trickling one byte
+     * every 4.9 s could hold a daemon's serve loop for as long as it cared
+     * to, and rcd's loop is the camera's whole configuration interface.
+     */
     int msg_len = read_message(client_fd, &cmd, 5000);
     if (msg_len < 0) {
         ret = msg_len;
