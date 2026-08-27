@@ -362,6 +362,22 @@ int rss_ring_publish_iov(rss_ring_t *ring, const rss_iov_t *iov, uint32_t iov_co
         atomic_store_explicit(&hdr->data_head, length, memory_order_relaxed);
     }
 
+    /* The reservation may cover bytes still referenced by older slots
+     * whose sequence numbers remain valid. A reader of such a slot
+     * would copy data mid-overwrite and pass its post-copy recheck,
+     * because that slot's seq never changed. Invalidate every slot
+     * whose data range overlaps the reserved region, and fence so the
+     * invalidations are globally visible before the first data write. */
+    for (uint32_t i = 0; i < slot_count; i++) {
+        rss_ring_slot_t *os = &ring->slots[i];
+        uint64_t oseq = atomic_load_explicit((_Atomic uint64_t *)&os->seq, memory_order_relaxed);
+        if (oseq == UINT64_MAX)
+            continue;
+        if (os->data_offset < offset + length && offset < os->data_offset + os->data_length)
+            atomic_store_explicit(&os->seq, UINT64_MAX, memory_order_relaxed);
+    }
+    atomic_thread_fence(memory_order_seq_cst);
+
     /* Copy iov segments contiguously into the data region. */
     uint32_t off = offset;
     for (uint32_t i = 0; i < iov_count; i++) {
