@@ -2,6 +2,8 @@
 #include "rss_ipc.h"
 
 #include <errno.h>
+#include <fcntl.h>
+#include <sys/mman.h>
 #include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -20,7 +22,7 @@
 static void publish_dummy(rss_ring_t *ring)
 {
     uint8_t d = 0xFF;
-    rss_ring_publish(ring, &d, 1, 0, 0, 0);
+    rss_ring_publish(ring, &d, 1, 0, 0, 0, RSS_SRC_SEQ_NONE);
 }
 
 TEST ring_create_open(void)
@@ -48,7 +50,7 @@ TEST ring_publish_read(void)
     ASSERT(c);
 
     uint8_t data[] = {0xDE, 0xAD, 0xBE, 0xEF};
-    ASSERT_EQ(0, rss_ring_publish(p, data, sizeof(data), 12345, 5, 1));
+    ASSERT_EQ(0, rss_ring_publish(p, data, sizeof(data), 12345, 5, 1, RSS_SRC_SEQ_NONE));
     publish_dummy(p); /* advance write_seq so frame at seq 1 is readable */
 
     uint64_t rseq = 1; /* skip phantom seq 0 */
@@ -78,7 +80,7 @@ TEST ring_sequential(void)
 
     for (int i = 0; i < 5; i++) {
         uint8_t d = (uint8_t)(0x10 + i);
-        ASSERT_EQ(0, rss_ring_publish(p, &d, 1, i * 100, 0, 0));
+        ASSERT_EQ(0, rss_ring_publish(p, &d, 1, i * 100, 0, 0, RSS_SRC_SEQ_NONE));
     }
     publish_dummy(p); /* make last frame readable */
 
@@ -109,7 +111,7 @@ TEST ring_overflow(void)
     /* Publish 8 frames into 4-slot ring */
     for (int i = 0; i < 8; i++) {
         uint8_t d = (uint8_t)i;
-        ASSERT_EQ(0, rss_ring_publish(p, &d, 1, 0, 0, 0));
+        ASSERT_EQ(0, rss_ring_publish(p, &d, 1, 0, 0, 0, RSS_SRC_SEQ_NONE));
     }
 
     /* Consumer at seq 1 should get overflow (wseq=8, 8-1=7 >= 4) */
@@ -134,7 +136,7 @@ TEST ring_overflow_recovery(void)
     /* Fill and overflow */
     for (int i = 0; i < 8; i++) {
         uint8_t d = (uint8_t)i;
-        rss_ring_publish(p, &d, 1, 0, 0, 0);
+        rss_ring_publish(p, &d, 1, 0, 0, 0, RSS_SRC_SEQ_NONE);
     }
 
     uint64_t rseq = 1;
@@ -144,8 +146,8 @@ TEST ring_overflow_recovery(void)
 
     /* Publish 2 more to make one readable */
     uint8_t fresh = 0xAA;
-    rss_ring_publish(p, &fresh, 1, 0, 0, 0); /* seq 9, makes seq 8 readable */
-    publish_dummy(p);                        /* seq 10, makes seq 9 readable */
+    rss_ring_publish(p, &fresh, 1, 0, 0, 0, RSS_SRC_SEQ_NONE); /* seq 9, makes seq 8 readable */
+    publish_dummy(p);                                          /* seq 10, makes seq 9 readable */
 
     /* rseq=8, wseq=10, reads slot[8%4=0] which has seq=8 */
     int ret = rss_ring_read(c, &rseq, buf, sizeof(buf), &len, NULL);
@@ -179,7 +181,7 @@ TEST ring_publish_iov(void)
         {b, sizeof(b)},
         {e, sizeof(e)},
     };
-    ASSERT_EQ(0, rss_ring_publish_iov(p, iov, 3, 999, 0, 0));
+    ASSERT_EQ(0, rss_ring_publish_iov(p, iov, 3, 999, 0, 0, RSS_SRC_SEQ_NONE));
     publish_dummy(p);
 
     uint64_t rseq = 1;
@@ -302,7 +304,7 @@ TEST ring_large_frame(void)
     uint8_t *frame = malloc(frame_size);
     ASSERT(frame);
     memset(frame, 0xAB, frame_size);
-    ASSERT_EQ(0, rss_ring_publish(p, frame, frame_size, 0, 0, 0));
+    ASSERT_EQ(0, rss_ring_publish(p, frame, frame_size, 0, 0, 0, RSS_SRC_SEQ_NONE));
     publish_dummy(p);
 
     uint8_t *dest = malloc(frame_size);
@@ -327,7 +329,7 @@ TEST ring_frame_too_large(void)
 
     uint8_t buf[2048];
     memset(buf, 0, sizeof(buf));
-    int ret = rss_ring_publish(p, buf, 2048, 0, 0, 0);
+    int ret = rss_ring_publish(p, buf, 2048, 0, 0, 0, RSS_SRC_SEQ_NONE);
     ASSERT_EQ(-ENOSPC, ret);
 
     rss_ring_destroy(p);
@@ -391,21 +393,21 @@ TEST ring_data_wrap(void)
     /* Fill data region: 100 + 100 = 200 bytes used, 56 remaining */
     uint8_t a[100];
     memset(a, 0xAA, sizeof(a));
-    rss_ring_publish(p, a, sizeof(a), 1000, 0, 0); /* seq 1, offset 0 */
+    rss_ring_publish(p, a, sizeof(a), 1000, 0, 0, RSS_SRC_SEQ_NONE); /* seq 1, offset 0 */
 
     uint8_t b[100];
     memset(b, 0xBB, sizeof(b));
-    rss_ring_publish(p, b, sizeof(b), 2000, 0, 0); /* seq 2, offset 100 */
+    rss_ring_publish(p, b, sizeof(b), 2000, 0, 0, RSS_SRC_SEQ_NONE); /* seq 2, offset 100 */
 
     /* Frame C: 100 bytes won't fit in remaining 56 → wraps to offset 0 */
     uint8_t cc[100];
     memset(cc, 0xCC, sizeof(cc));
-    rss_ring_publish(p, cc, sizeof(cc), 3000, 0, 0); /* seq 3, offset 0 (wrap!) */
+    rss_ring_publish(p, cc, sizeof(cc), 3000, 0, 0, RSS_SRC_SEQ_NONE); /* seq 3, offset 0 (wrap!) */
 
     /* Frame D: goes after C at offset 100 */
     uint8_t dd[80];
     memset(dd, 0xDD, sizeof(dd));
-    rss_ring_publish(p, dd, sizeof(dd), 4000, 0, 0); /* seq 4, offset 100 */
+    rss_ring_publish(p, dd, sizeof(dd), 4000, 0, 0, RSS_SRC_SEQ_NONE); /* seq 4, offset 100 */
 
     publish_dummy(p); /* seq 5, makes seq 4 readable */
 
@@ -452,7 +454,7 @@ TEST ring_multi_consumer(void)
     int fast_read_count = 0;
     for (int i = 0; i < 20; i++) {
         uint8_t d = (uint8_t)(0x40 + i);
-        rss_ring_publish(p, &d, 1, (i + 1) * 100, 0, 0);
+        rss_ring_publish(p, &d, 1, (i + 1) * 100, 0, 0, RSS_SRC_SEQ_NONE);
 
         /* Fast consumer reads every 2 publishes to stay current */
         if ((i % 2) == 1) {
@@ -580,6 +582,154 @@ TEST ring_utc_mapping(void)
     PASS();
 }
 
+/* v5: source-sequence loss accounting */
+TEST ring_src_seq_loss(void)
+{
+    /* 16 slots: this test publishes 9 frames and still reads slot 1
+     * at the end (read would EOVERFLOW with an 8-slot ring). */
+    rss_ring_t *p = rss_ring_create("t_srcseq", 16, 65536);
+    ASSERT(p);
+    rss_ring_t *c = rss_ring_open("t_srcseq");
+    ASSERT(c);
+
+    uint8_t d[8] = {0};
+    rss_ring_loss_t loss;
+
+    /* Baseline starts at NONE: first stamped frame sets it, no loss */
+    rss_ring_publish(p, d, sizeof(d), 0, 0, 1, 100);
+    rss_ring_get_loss(c, &loss);
+    ASSERT_EQ(0, loss.drop_source);
+    ASSERT_EQ(0, loss.drop_publish);
+    ASSERT_EQ(0, loss.src_seq_resets);
+    ASSERT_EQ(100, loss.src_seq_last);
+
+    /* Normal advance: seq + 1, still no loss */
+    rss_ring_publish(p, d, sizeof(d), 0, 0, 1, 101);
+    rss_ring_get_loss(c, &loss);
+    ASSERT_EQ(0, loss.drop_source);
+    ASSERT_EQ(0, loss.drop_publish);
+
+    /* Jump of 3: two source frames never fetched */
+    rss_ring_publish(p, d, sizeof(d), 0, 0, 1, 104);
+    rss_ring_get_loss(c, &loss);
+    ASSERT_EQ(2, loss.drop_source);
+    ASSERT_EQ(0, loss.drop_publish);
+
+    /* Fetched but dropped before publish */
+    rss_ring_report_drop(p, 105);
+    rss_ring_get_loss(c, &loss);
+    ASSERT_EQ(2, loss.drop_source);
+    ASSERT_EQ(1, loss.drop_publish);
+    ASSERT_EQ(105, loss.src_seq_last);
+
+    /* Publish resumes at the next frame: no double count */
+    rss_ring_publish(p, d, sizeof(d), 0, 0, 1, 106);
+    rss_ring_get_loss(c, &loss);
+    ASSERT_EQ(2, loss.drop_source);
+    ASSERT_EQ(1, loss.drop_publish);
+
+    /* Backward jump: reset, not loss */
+    rss_ring_publish(p, d, sizeof(d), 0, 0, 1, 5);
+    rss_ring_get_loss(c, &loss);
+    ASSERT_EQ(2, loss.drop_source);
+    ASSERT_EQ(1, loss.drop_publish);
+    ASSERT_EQ(1, loss.src_seq_resets);
+    ASSERT_EQ(5, loss.src_seq_last);
+
+    /* 32-bit wrap reads as +1 advance, not a giant loss */
+    rss_ring_publish(p, d, sizeof(d), 0, 0, 1, 0xFFFFFFFFu);
+    rss_ring_publish(p, d, sizeof(d), 0, 0, 1, 0);
+    rss_ring_get_loss(c, &loss);
+    ASSERT_EQ(2, loss.drop_source);
+    ASSERT_EQ(1, loss.drop_publish);
+    ASSERT_EQ(0, loss.src_seq_last);
+
+    /* Legacy publish after stamped frames: NONE is stamped, accounting
+     * paused (baseline preserved) */
+    rss_ring_publish(p, d, sizeof(d), 0, 0, 1, RSS_SRC_SEQ_NONE);
+    rss_ring_get_loss(c, &loss);
+    ASSERT_EQ(0, loss.src_seq_last);
+    /* stamped frame resuming from the preserved baseline */
+    rss_ring_publish(p, d, sizeof(d), 0, 0, 1, 1);
+    rss_ring_get_loss(c, &loss);
+    ASSERT_EQ(2, loss.drop_source);
+    ASSERT_EQ(1, loss.drop_publish);
+    ASSERT_EQ(1, loss.src_seq_last);
+
+    /* Consumer can read the src_seq back from the slot */
+    uint64_t read_seq = 1;
+    uint32_t len;
+    rss_ring_slot_t meta;
+    ASSERT_EQ(0, rss_ring_read(c, &read_seq, d, sizeof(d), &len, &meta));
+    ASSERT_EQ(100, meta.src_seq);
+
+    rss_ring_close(c);
+    rss_ring_destroy(p);
+    PASS();
+}
+
+/* v5: refmode publish stamps src_seq too */
+TEST ring_ref_seq_loss(void)
+{
+    /* 2 ref bufs of 4096 bytes. The consumer maps the named enc SHM
+     * (tried before /dev/rmem), so create it here and the test runs on
+     * any host, not only on a device with reserved memory. */
+    int rfd = shm_open("/rss_enc_t_refseq", O_CREAT | O_RDWR, 0666);
+    ASSERT(rfd >= 0);
+    ASSERT_EQ(0, ftruncate(rfd, 8192));
+    close(rfd);
+    rss_ring_t *p = rss_ring_create("t_refseq", 8, 4096);
+    ASSERT(p);
+    ASSERT_EQ(0, rss_ring_enable_refmode(p, 8192, 0, 2, 4096));
+    rss_ring_t *c = rss_ring_open("t_refseq");
+    ASSERT(c);
+
+    rss_ring_loss_t loss;
+    ASSERT_EQ(0, rss_ring_publish_ref(p, 0, 100, 10, 0, 1, 0, 10));
+    ASSERT_EQ(0, rss_ring_publish_ref(p, 4096, 100, 20, 0, 1, 1, 12));
+    rss_ring_get_loss(c, &loss);
+    ASSERT_EQ(1, loss.drop_source);
+    ASSERT_EQ(0, loss.drop_publish);
+    ASSERT_EQ(12, loss.src_seq_last);
+
+    rss_ring_close(c);
+    rss_ring_destroy(p);
+    shm_unlink("/rss_enc_t_refseq");
+    PASS();
+}
+
+/* A drop reported across a sequence-domain jump is a boundary, not a
+ * loss: without the MAX_GAP guard one dropped frame after an encoder
+ * restart booked the whole jump as drop_source. */
+TEST ring_report_drop_domain_jump(void)
+{
+    rss_ring_t *p = rss_ring_create("t_rdjump", 8, 65536);
+    ASSERT(p);
+    uint8_t d[8] = {0};
+    rss_ring_loss_t loss;
+
+    rss_ring_publish(p, d, sizeof(d), 0, 0, 1, 100);
+    rss_ring_report_drop(p, 100 + 300000); /* absurd forward: domain change */
+    rss_ring_get_loss(p, &loss);
+    ASSERT_EQ(0, loss.drop_source);
+    ASSERT_EQ(1, loss.drop_publish);
+    ASSERT_EQ(1, loss.src_seq_resets);
+
+    rss_ring_report_drop(p, 7); /* backward: domain change too */
+    rss_ring_get_loss(p, &loss);
+    ASSERT_EQ(0, loss.drop_source);
+    ASSERT_EQ(2, loss.drop_publish);
+    ASSERT_EQ(2, loss.src_seq_resets);
+
+    rss_ring_report_drop(p, 7); /* duplicate: a drop, not a reset */
+    rss_ring_get_loss(p, &loss);
+    ASSERT_EQ(3, loss.drop_publish);
+    ASSERT_EQ(2, loss.src_seq_resets);
+
+    rss_ring_destroy(p);
+    PASS();
+}
+
 SUITE(ring_suite)
 {
     RUN_TEST(ring_create_open);
@@ -603,4 +753,7 @@ SUITE(ring_suite)
     RUN_TEST(ring_magic_mismatch_open);
     RUN_TEST(ring_version_check_helpers);
     RUN_TEST(ring_utc_mapping);
+    RUN_TEST(ring_src_seq_loss);
+    RUN_TEST(ring_report_drop_domain_jump);
+    RUN_TEST(ring_ref_seq_loss);
 }

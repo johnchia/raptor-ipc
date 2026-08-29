@@ -256,6 +256,11 @@ rss_ring_t *rss_ring_create(const char *name, uint32_t slot_count, uint32_t data
     ring->header->data_size = data_size;
     atomic_store_explicit(&ring->header->data_head, 0, memory_order_relaxed);
     ring->header->version = RSS_RING_VERSION;
+    /* v5: loss counters zeroed by the memset above; the tracked source
+     * sequence starts at NONE so the first stamped frame only sets the
+     * baseline (a 0 baseline would misclassify the source's first
+     * frame as a huge jump and record a bogus reset). */
+    atomic_store_explicit(&ring->header->src_seq_last, RSS_SRC_SEQ_NONE, memory_order_relaxed);
     atomic_store_explicit(&ring->header->incarnation, prev_inc + 1, memory_order_relaxed);
     /* Remember the geometry this handle actually mapped. The header is
      * shared and a later create() may enlarge it; publishing must be
@@ -310,8 +315,43 @@ void rss_ring_destroy(rss_ring_t *ring)
     free(ring);
 }
 
+/* v5: update the source-sequence loss counters for an incoming frame
+ * stamped src_seq. Returns the value to store in slot->src_seq.
+ *
+ * diff is computed as a signed 32-bit difference so a legitimate
+ * wraparound of the source counter (0xFFFFFFFF -> 0) reads as +1, not as
+ * a four-billion-frame loss. See RSS_SRC_SEQ_MAX_GAP in rss_ipc.h. */
+static uint32_t ring_seq_update_loss(rss_ring_header_t *hdr, uint32_t src_seq)
+{
+    if (src_seq == RSS_SRC_SEQ_NONE)
+        return RSS_SRC_SEQ_NONE;
+
+    uint32_t last = atomic_load_explicit(&hdr->src_seq_last, memory_order_relaxed);
+    if (last != RSS_SRC_SEQ_NONE) {
+        int32_t diff = (int32_t)(src_seq - last);
+        if (diff == 1) {
+            /* normal advance */
+        } else if (diff > 1 && (uint32_t)diff <= RSS_SRC_SEQ_MAX_GAP) {
+            /* frames the source produced but the producer never fetched
+             * (or never saw) between these two published frames */
+            atomic_fetch_add_explicit(&hdr->drop_source, (uint32_t)(diff - 1),
+                                      memory_order_relaxed);
+        } else if (diff <= 0) {
+            /* backward jump: new sequence domain (encoder restart,
+             * source counter rewrap with duplicate). Rebase, don't
+             * count as loss. */
+            atomic_fetch_add_explicit(&hdr->src_seq_resets, 1, memory_order_relaxed);
+        } else {
+            /* absurd forward jump: treat as domain change too */
+            atomic_fetch_add_explicit(&hdr->src_seq_resets, 1, memory_order_relaxed);
+        }
+    }
+    atomic_store_explicit(&hdr->src_seq_last, src_seq, memory_order_relaxed);
+    return src_seq;
+}
+
 int rss_ring_publish_iov(rss_ring_t *ring, const rss_iov_t *iov, uint32_t iov_count,
-                         int64_t timestamp, uint16_t nal_type, uint8_t is_key)
+                         int64_t timestamp, uint16_t nal_type, uint8_t is_key, uint32_t src_seq)
 {
     if (!ring || !ring->is_producer || !iov || iov_count == 0)
         return -EINVAL;
@@ -403,6 +443,7 @@ int rss_ring_publish_iov(rss_ring_t *ring, const rss_iov_t *iov, uint32_t iov_co
     slot->is_key = is_key;
     slot->buf_idx = 0;
     slot->buf_gen = 0;
+    slot->src_seq = ring_seq_update_loss(hdr, src_seq);
 
     /* Write the valid slot sequence AFTER data is fully written. */
     atomic_store_explicit(&slot->seq, seq, memory_order_relaxed);
@@ -418,10 +459,10 @@ int rss_ring_publish_iov(rss_ring_t *ring, const rss_iov_t *iov, uint32_t iov_co
 }
 
 int rss_ring_publish(rss_ring_t *ring, const uint8_t *data, uint32_t length, int64_t timestamp,
-                     uint16_t nal_type, uint8_t is_key)
+                     uint16_t nal_type, uint8_t is_key, uint32_t src_seq)
 {
     rss_iov_t iov = {.data = data, .length = length};
-    return rss_ring_publish_iov(ring, &iov, 1, timestamp, nal_type, is_key);
+    return rss_ring_publish_iov(ring, &iov, 1, timestamp, nal_type, is_key, src_seq);
 }
 
 int rss_ring_enable_refmode(rss_ring_t *ring, uint32_t rmem_size, uint32_t rmem_offset,
@@ -460,7 +501,7 @@ int rss_ring_enable_refmode(rss_ring_t *ring, uint32_t rmem_size, uint32_t rmem_
 }
 
 int rss_ring_publish_ref(rss_ring_t *ring, uint32_t rmem_offset, uint32_t length, int64_t timestamp,
-                         uint16_t nal_type, uint8_t is_key, uint8_t buf_idx)
+                         uint16_t nal_type, uint8_t is_key, uint8_t buf_idx, uint32_t src_seq)
 {
     if (!ring || !ring->is_producer || length == 0)
         return -EINVAL;
@@ -498,6 +539,7 @@ int rss_ring_publish_ref(rss_ring_t *ring, uint32_t rmem_offset, uint32_t length
     slot->is_key = is_key;
     slot->buf_idx = buf_idx;
     slot->buf_gen = gen;
+    slot->src_seq = ring_seq_update_loss(hdr, src_seq);
 
     atomic_store_explicit(&slot->seq, seq, memory_order_relaxed);
     atomic_store_explicit(&hdr->write_seq, seq, memory_order_release);
@@ -505,6 +547,65 @@ int rss_ring_publish_ref(rss_ring_t *ring, uint32_t rmem_offset, uint32_t length
     futex_wake((uint32_t *)&hdr->futex_seq, INT_MAX);
 
     return 0;
+}
+
+void rss_ring_report_drop(rss_ring_t *ring, uint32_t src_seq)
+{
+    if (!ring || !ring->is_producer)
+        return;
+    rss_ring_header_t *hdr = ring->header;
+
+    if (src_seq == RSS_SRC_SEQ_NONE)
+        return;
+
+    uint32_t last = atomic_load_explicit(&hdr->src_seq_last, memory_order_relaxed);
+    if (last != RSS_SRC_SEQ_NONE) {
+        int32_t diff = (int32_t)(src_seq - last);
+        if (diff > 0 && (uint32_t)diff <= RSS_SRC_SEQ_MAX_GAP) {
+            /* frames strictly between last and this one were never
+             * fetched (source loss); the frame itself was fetched and
+             * dropped. Report each fetched frame exactly once: a second
+             * call for the same seq double-counts drop_publish. */
+            if (diff > 1)
+                atomic_fetch_add_explicit(&hdr->drop_source, (uint32_t)(diff - 1),
+                                          memory_order_relaxed);
+            atomic_fetch_add_explicit(&hdr->drop_publish, 1, memory_order_relaxed);
+        } else if (diff != 0) {
+            /* A jump the publish path would treat as a domain change
+             * (backward, or forward past RSS_SRC_SEQ_MAX_GAP) is one
+             * here too: the dropped frame counts, the gap is a
+             * boundary, not a loss. Without this guard one dropped
+             * frame after an encoder restart booked the whole jump as
+             * drop_source. */
+            atomic_fetch_add_explicit(&hdr->src_seq_resets, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&hdr->drop_publish, 1, memory_order_relaxed);
+        } else {
+            /* duplicate report of the tracked seq: count only the drop */
+            atomic_fetch_add_explicit(&hdr->drop_publish, 1, memory_order_relaxed);
+        }
+    } else {
+        /* first observed source frame, and it was dropped */
+        atomic_fetch_add_explicit(&hdr->drop_publish, 1, memory_order_relaxed);
+    }
+    atomic_store_explicit(&hdr->src_seq_last, src_seq, memory_order_relaxed);
+}
+
+void rss_ring_get_loss(rss_ring_t *ring, rss_ring_loss_t *out)
+{
+    if (!out)
+        return;
+    if (!ring || !ring->header) {
+        out->drop_source = 0;
+        out->drop_publish = 0;
+        out->src_seq_resets = 0;
+        out->src_seq_last = RSS_SRC_SEQ_NONE;
+        return;
+    }
+    const rss_ring_header_t *hdr = ring->header;
+    out->drop_source = atomic_load_explicit(&hdr->drop_source, memory_order_relaxed);
+    out->drop_publish = atomic_load_explicit(&hdr->drop_publish, memory_order_relaxed);
+    out->src_seq_resets = atomic_load_explicit(&hdr->src_seq_resets, memory_order_relaxed);
+    out->src_seq_last = atomic_load_explicit(&hdr->src_seq_last, memory_order_relaxed);
 }
 
 void rss_ring_set_stream_info(rss_ring_t *ring, uint32_t stream_id, uint32_t codec, uint32_t width,
