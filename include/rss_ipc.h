@@ -380,6 +380,24 @@ void rss_osd_heartbeat(rss_osd_shm_t *shm);
 int rss_osd_get_fd(rss_osd_shm_t *shm);
 int rss_osd_get_eventfd(rss_osd_shm_t *shm);
 
+/*
+ * rss_osd_parse_font_size -- the overlay's font size, as a config spells it.
+ *
+ * "24" is a count of pixels and "4.5%" is that share of a picture's height,
+ * returned in tenths of a percent. Exactly one of the two comes back non-zero.
+ *
+ * It lives with the OSD transport because both ends of it read this spelling
+ * and must read it the same way: rod sizes the bitmaps it draws from the
+ * answer, and rvd sizes the pool those bitmaps are allocated out of. A
+ * percentage one of them read as a count of pixels is a pool too small for
+ * the regions the other is about to create.
+ *
+ * False for anything else, with both outputs zeroed, and the caller keeps
+ * whatever default it had: a size nobody can read is not a reason to draw no
+ * overlay.
+ */
+bool rss_osd_parse_font_size(const char *spec, int *px, int *pct);
+
 /* ------------------------------------------------------------------ */
 /*  Control Socket (section 2.3)                                      */
 /* ------------------------------------------------------------------ */

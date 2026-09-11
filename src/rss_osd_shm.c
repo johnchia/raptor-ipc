@@ -370,3 +370,48 @@ int rss_osd_get_eventfd(rss_osd_shm_t *shm)
 {
     return shm ? shm->event_fd : -1;
 }
+
+/*
+ * A font size as a config spells it. See rss_ipc.h for why this is here.
+ *
+ * Tenths of a percent, because whole ones are too coarse to steer with: one
+ * percent of a 1520-line encode is fifteen pixels, so a range wide enough to
+ * hold every size anybody wants would have about nine positions in it.
+ */
+bool rss_osd_parse_font_size(const char *spec, int *px, int *pct)
+{
+    char *end;
+    long whole, tenths = 0;
+
+    if (!px || !pct)
+        return false;
+    *px = 0;
+    *pct = 0;
+    if (!spec)
+        return false;
+
+    whole = strtol(spec, &end, 10);
+    if (end == spec || whole < 0 || whole > 10000)
+        return false;
+
+    if (*end == '.') {
+        if (end[1] < '0' || end[1] > '9')
+            return false;
+        tenths = end[1] - '0';
+        /* Anything past the first decimal is below a pixel on any picture
+         * this encodes. */
+        for (end += 2; *end >= '0' && *end <= '9'; end++)
+            ;
+    }
+
+    if (*end == '%') {
+        *pct = (int)(whole * 10 + tenths);
+        return end[1] == '\0' && *pct > 0;
+    }
+
+    /* A fractional pixel is not a size a glyph cache has. */
+    if (*end != '\0' || tenths)
+        return false;
+    *px = (int)whole;
+    return *px > 0;
+}

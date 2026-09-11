@@ -112,6 +112,48 @@ TEST osd_heartbeat(void)
 	PASS();
 }
 
+/*
+ * The spelling both ends of the OSD transport read. What matters is not that
+ * the two forms parse but that nothing is silently taken for the other one: a
+ * percentage read as pixels sizes a pool for a twenty-fifth of the bitmap rod
+ * is about to ask for.
+ */
+TEST osd_font_size_spelling(void)
+{
+    int px = -1, pct = -1;
+
+    ASSERT(rss_osd_parse_font_size("24", &px, &pct));
+    ASSERT_EQ(24, px);
+    ASSERT_EQ(0, pct);
+
+    ASSERT(rss_osd_parse_font_size("4%", &px, &pct));
+    ASSERT_EQ(0, px);
+    ASSERT_EQ(40, pct);
+
+    /* Tenths, because whole percent is a fifteen-pixel step on a 1520-line
+     * encode. */
+    ASSERT(rss_osd_parse_font_size("4.5%", &px, &pct));
+    ASSERT_EQ(45, pct);
+
+    /* A trailing '%' is the whole difference between the two, so nothing
+     * that merely looks like one may be taken for it. */
+    ASSERT_FALSE(rss_osd_parse_font_size("4 %", &px, &pct));
+    ASSERT_FALSE(rss_osd_parse_font_size("4%%", &px, &pct));
+    ASSERT_FALSE(rss_osd_parse_font_size("%", &px, &pct));
+    ASSERT_FALSE(rss_osd_parse_font_size("24px", &px, &pct));
+    ASSERT_FALSE(rss_osd_parse_font_size("24.5", &px, &pct));
+    ASSERT_FALSE(rss_osd_parse_font_size("-4%", &px, &pct));
+    ASSERT_FALSE(rss_osd_parse_font_size("", &px, &pct));
+    ASSERT_FALSE(rss_osd_parse_font_size(NULL, &px, &pct));
+
+    /* And a refusal leaves nothing behind for a caller that does not
+     * check: zero in both is "no size given", which is what an element
+     * without one is. */
+    ASSERT_EQ(0, px);
+    ASSERT_EQ(0, pct);
+    PASS();
+}
+
 SUITE(osd_suite)
 {
 	RUN_TEST(osd_create_open);
@@ -119,4 +161,5 @@ SUITE(osd_suite)
 	RUN_TEST(osd_dirty_flag);
 	RUN_TEST(osd_double_buffer);
 	RUN_TEST(osd_heartbeat);
+    RUN_TEST(osd_font_size_spelling);
 }
